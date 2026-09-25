@@ -30,8 +30,17 @@
 新增管段编号升序列表字典序 -> 关阀编号升序列表字典序。无解时说明候选
 范围内不可修复。
 
+以及 solve_cross_connect(snapshot, closed_valves, cross_connections):
+临时供水跨接预览(只读计算)。基于已保存可行方案的快照与已关阀清单, 录入
+至多 6 条候选跨接(唯一编号 + 两个不同的现有节点 + 正整数铺设费), 跨接视为
+无阀、始终通水的新增管段; 在关阀后的基线上枚举候选跨接的全部铺设子集,
+要求铺设后全部漏点仍与进水点断开、全部必保点仍有水。优化次序: 由断水转
+有水的普通节点数最多 -> 铺设费合计最小 -> 跨接编号升序列表字典序。最优
+组合也无法恢复任何普通节点时返回空方案(不铺设跨接, 费用 0)。
+
 阀门最多 14 个, 枚举全部 2^V 个子集(V<=14 => 16384), 对每个子集做
-BFS 连通性检查即可, 简单且确定。
+BFS 连通性检查即可, 简单且确定。跨接候选最多 6 条, 枚举 2^C(C<=6 => 64)
+个铺设子集, 同样在加边后的图上做 BFS。
 """
 
 from __future__ import annotations
@@ -823,6 +832,260 @@ def _infeasible(code: str, message: str, extra: dict | None = None,
     if extra:
         out["reason_detail"] = extra
     return out
+
+
+# ---------------------------------------------------------------------------
+# 临时供水跨接预览(只读计算, 针对历史可行隔离方案)
+# ---------------------------------------------------------------------------
+
+MAX_CROSS_CONNECTIONS = 6
+
+
+class CrossConnectionInputError(NetworkValidationError):
+    """临时供水跨接预览的录入数据不合法, errors 字段携带逐条原因。"""
+
+
+def solve_cross_connect(snapshot: dict[str, Any],
+                        closed_valves: list[str],
+                        raw_cross: Any) -> dict[str, Any]:
+    """对已保存的可行隔离方案做临时供水跨接预览(只读, 不改管网/不改方案)。
+
+    模型:
+      - 以方案快照管网 + 计划关阀清单为基线(关阀即删除对应管段)。
+      - 候选跨接 = 至多 MAX_CROSS_CONNECTIONS 条新增通水管段(无阀, 始终通水),
+        每条有唯一编号、两个不同的现有节点、正整数铺设费。
+      - 枚举候选跨接的全部子集(铺设组合), 要求铺设后:
+        (A) 全部漏点仍与所有进水点断开(不允许跨接把漏点分量重新接回供水);
+        (B) 全部必保点仍连通至少一个进水点。
+      - 优化次序(仅在满足 (A)(B) 的组合中):
+        1) 由断水转为有水的普通节点数最多;
+        2) 铺设费合计最小;
+        3) 跨接编号升序列表字典序最小。
+      - 最优组合也无法恢复任何普通节点(恢复数为 0)时返回空方案
+        (不铺设任何跨接, 费用 0)。
+    """
+    try:
+        nodes, segments, valves = validate_network(snapshot)
+    except NetworkValidationError as exc:
+        raise CrossConnectionInputError(
+            ["方案快照数据不合法: " + e for e in exc.errors])
+    g = _Graph(nodes, segments, valves)
+
+    errors: list[str] = []
+
+    # ---- 计划关阀清单必须存在于快照中 ----
+    if not isinstance(closed_valves, list):
+        raise CrossConnectionInputError(["方案关阀清单数据不合法"])
+    valve_ids = {vl["id"] for vl in valves}
+    plan_valves = sorted(dict.fromkeys(str(v).strip() for v in closed_valves))
+    for vid in plan_valves:
+        if vid not in valve_ids:
+            errors.append(f"计划阀门 {vid} 不存在于方案快照的管网中")
+
+    # ---- 候选跨接录入校验 ----
+    if raw_cross is None:
+        raw_cross = []
+    if not isinstance(raw_cross, list):
+        raise CrossConnectionInputError(["cross_connections 必须是数组"])
+    if len(raw_cross) > MAX_CROSS_CONNECTIONS:
+        errors.append(f"候选跨接数量为 {len(raw_cross)}, "
+                      f"超过上限 {MAX_CROSS_CONNECTIONS} 个")
+    node_id_set = {nd["id"] for nd in nodes}
+    cross_ids: set[str] = set()
+    candidates: list[dict[str, Any]] = []
+    for i, cc in enumerate(raw_cross):
+        if not isinstance(cc, dict):
+            errors.append(f"跨接 #{i + 1}: 必须是对象")
+            continue
+        cid = _norm_id(cc.get("id"))
+        if not cid:
+            errors.append(f"跨接 #{i + 1}: 缺少编号")
+        elif cid in cross_ids:
+            errors.append(f"跨接编号重复: {cid}")
+        a = _norm_id(cc.get("endpoint_a"))
+        b = _norm_id(cc.get("endpoint_b"))
+        label = cid or f"#{i + 1}"
+        if not a or not b:
+            errors.append(f"跨接 {label}: 必须选择两个端点")
+        if a and a not in node_id_set:
+            errors.append(f"跨接 {label}: 端点 {a} 不存在于方案快照节点中")
+        if b and b not in node_id_set:
+            errors.append(f"跨接 {label}: 端点 {b} 不存在于方案快照节点中")
+        if a and b and a == b:
+            errors.append(f"跨接 {label}: 两个端点不能相同({a})")
+        cost_int = _strict_pos_int(cc.get("cost"))
+        if cost_int is None:
+            errors.append(f"跨接 {label}: 铺设费必须是正整数, "
+                          f"收到: {cc.get('cost')!r}")
+        if cid:
+            cross_ids.add(cid)
+        candidates.append({"id": cid, "endpoint_a": a, "endpoint_b": b,
+                           "cost": cost_int})
+
+    if errors:
+        raise CrossConnectionInputError(errors)
+
+    # ---- 基线(方案正常执行)关阀掩码与供水可达 ----
+    v_idx = {vl["id"]: b for b, vl in enumerate(g.valves_sorted)}
+    base_mask = 0
+    for vid in plan_valves:
+        base_mask |= 1 << v_idx[vid]
+    base_fed = g.reachable(base_mask, g.inlet_set)
+    normal_bits = sum(1 << i for i, nd in enumerate(nodes)
+                      if nd["role"] == "normal")
+    base_dry_normals = normal_bits & ~base_fed
+
+    # 候选跨接按编号升序定位序, 保证位序确定、并列时按编号列表字典序决胜
+    cand_sorted = sorted(candidates, key=lambda c: c["id"])
+    nc = len(cand_sorted)
+    cand_edges: list[tuple[int, int]] = []
+    for c in cand_sorted:
+        cand_edges.append((g.idx[c["endpoint_a"]], g.idx[c["endpoint_b"]]))
+
+    def reach_with(sources: set[int], cmask: int) -> int:
+        """在基线(已关阀)图上额外铺设 cmask 指定的跨接后, 从 sources 可达位掩码。"""
+        seen = 0
+        dq: deque[int] = deque()
+        for s in sources:
+            if not (seen >> s) & 1:
+                seen |= 1 << s
+                dq.append(s)
+        while dq:
+            u = dq.popleft()
+            for w, e in g.adj[u]:
+                bit = g.edge_closed_bit[e]
+                if bit and (base_mask & bit):
+                    continue  # 方案已关阀管段, 保持断管
+                if not (seen >> w) & 1:
+                    seen |= 1 << w
+                    dq.append(w)
+            for b in range(nc):  # 候选跨接为无阀新增管段, 选中即始终通水
+                if (cmask >> b) & 1:
+                    x, y = cand_edges[b]
+                    if (seen >> x) & 1 and not (seen >> y) & 1:
+                        seen |= 1 << y
+                        dq.append(y)
+                    if (seen >> y) & 1 and not (seen >> x) & 1:
+                        seen |= 1 << x
+                        dq.append(x)
+        return seen
+
+    # ---- 枚举全部候选组合 ----
+    total = 1 << nc
+    valid_count = 0
+    best_key: tuple[int, int, tuple[str, ...]] | None = None
+    best_mask = 0
+    for cmask in range(total):
+        fed = reach_with(g.inlet_set, cmask)
+        if fed & g.leak_bits:
+            continue  # (A) 有漏点经跨接复通进水点
+        if (fed & g.keep_bits) != g.keep_bits:
+            continue  # (B) 必保点失去供水(加边只会增连通, 正常不会触发)
+        valid_count += 1
+        recovered = (fed & base_dry_normals).bit_count()
+        cost = sum(cand_sorted[b]["cost"] for b in range(nc)
+                   if (cmask >> b) & 1)
+        selected = tuple(cand_sorted[b]["id"] for b in range(nc)
+                         if (cmask >> b) & 1)
+        # 恢复数最多(取负做升序) -> 铺设费最小 -> 编号升序列表字典序最小
+        key = (-recovered, cost, selected)
+        if best_key is None or key < best_key:
+            best_key, best_mask = key, cmask
+
+    recovered_count = -best_key[0]
+    total_cost = best_key[1]
+    selected_ids = list(best_key[2])
+    can_recover = recovered_count > 0
+
+    # ---- 构造各节点状态(铺设后视角, 含跨接前后供水对比) ----
+    fed = reach_with(g.inlet_set, best_mask)
+    inlet_of: list[list[str]] = [[] for _ in range(g.n)]
+    for j in sorted(g.inlet_set):
+        r = reach_with({j}, best_mask)
+        for i in range(g.n):
+            if (r >> i) & 1:
+                inlet_of[i].append(g.nodes[j]["id"])
+
+    recovered_set = fed & base_dry_normals
+    node_status: list[dict[str, Any]] = []
+    for i, nd in enumerate(g.nodes):
+        is_fed = bool((fed >> i) & 1)
+        before_fed = bool((base_fed >> i) & 1)
+        if nd["role"] == "leak":
+            status = "isolated" if not is_fed else "leak_not_isolated"
+        elif not is_fed:
+            status = "disconnected"
+        elif nd["role"] == "inlet":
+            status = "inlet_supply"
+        else:
+            status = "supplied"
+        node_status.append({
+            "id": nd["id"], "label": nd["label"], "role": nd["role"],
+            "supplied": is_fed, "status": status,
+            "before_supplied": before_fed,
+            "recovered": bool((recovered_set >> i) & 1),
+            "connected_inlets": inlet_of[i],
+        })
+
+    recovered_ids = [g.nodes[i]["id"] for i in range(g.n)
+                     if (recovered_set >> i) & 1]
+    dry_ids = [g.nodes[i]["id"] for i in range(g.n)
+               if (base_dry_normals >> i) & 1]
+    selected_cc = [{
+        "id": cand_sorted[b]["id"],
+        "endpoint_a": cand_sorted[b]["endpoint_a"],
+        "endpoint_b": cand_sorted[b]["endpoint_b"],
+        "cost": cand_sorted[b]["cost"],
+        "status": "flowing",
+    } for b in range(nc) if (best_mask >> b) & 1]
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "solver": "cross_connect",
+        "plan_closed_valves": plan_valves,
+        "candidate_count": nc,
+        "subset_count": total,
+        "valid_subset_count": valid_count,
+        "base_dry_normal_ids": dry_ids,
+        "can_recover": can_recover,
+        "selected_cross_connections": selected_cc,
+        "selected_ids": selected_ids,
+        "total_cost": total_cost if can_recover else 0,
+        "recovered_node_count": recovered_count,
+        "recovered_node_ids": recovered_ids,
+        "node_status": node_status,
+    }
+
+    if not can_recover:
+        # 区分: 断水普通点是否与漏点同处断水分量(注定无法恢复)
+        leak_comp = g.reachable(base_mask, g.leak_set)
+        with_leak = base_dry_normals & leak_comp
+        stranded = base_dry_normals & ~leak_comp
+        if not dry_ids:
+            reason = "方案下全部普通节点均已由进水点供水, 无需铺设跨接。"
+        elif with_leak and stranded:
+            reason = (f"断水普通节点中 {with_leak.bit_count()} 个与漏点同处"
+                      f"断水分量(任何跨接都会使漏点复通进水点), 其余 "
+                      f"{stranded.bit_count()} 个也无法用当前候选跨接恢复供水。")
+        elif with_leak:
+            reason = ("断水普通节点均与漏点同处断水分量, 任何跨接都会使漏点"
+                      "复通进水点, 不能恢复其供水。")
+        else:
+            reason = "当前候选跨接无法在不使漏点复通的前提下恢复任何断水普通节点供水。"
+        result["message"] = (
+            "临时供水跨接预览(只读, 不修改管网与历史方案): " + reason
+            + " 返回空方案: 不铺设跨接, 铺设费 0。")
+        return result
+
+    desc = "; ".join(f"{c['id']}({c['endpoint_a']}—{c['endpoint_b']}, "
+                     f"费用 {c['cost']})" for c in selected_cc)
+    result["message"] = (
+        "临时供水跨接预览(只读, 不修改管网与历史方案): 铺设跨接 "
+        f"{desc}; 铺设费合计 {result['total_cost']}, 新恢复 "
+        f"{recovered_count} 个断水普通节点供水"
+        f"({', '.join(recovered_ids)})。铺设后全部漏点仍与进水点断开、"
+        "全部必保点仍有供水。")
+    return result
 
 
 # ---------------------------------------------------------------------------

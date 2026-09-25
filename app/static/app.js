@@ -6,6 +6,7 @@ const state = {
   segments: [],
   valves: [],
   candidates: [], // 选址候选: {id, segment_id, install_cost, close_cost}
+  crossRows: [],  // 临时供水跨接候选(按方案局部): {id, endpoint_a, endpoint_b, cost}
   result: null,
   layout: new Map(), // nodeId -> {x,y}
 };
@@ -299,6 +300,7 @@ function renderResult(r) {
   if (r.solver === "failover") {
     renderFailover(r, banner, body);
     appendSequencePanel(r);
+    appendCrossConnectPanel(r);
     drawCanvas();
     return;
   }
@@ -324,6 +326,7 @@ function renderResult(r) {
       ${segmentStatusTable(r.segment_status)}
     </div>`;
   appendSequencePanel(r);
+  appendCrossConnectPanel(r);
   drawCanvas();
 }
 
@@ -629,6 +632,189 @@ function renderSequenceResult(res) {
       <td><b>${st.cumulative_exposure}</b></td>
     </tr>`).join("")}
     </tbody></table>`;
+}
+
+// ---------- 临时供水跨接预览 ----------
+// 入口: 可行方案详情(历史方案"查看"或刚求解出的方案)底部。基于方案快照与
+// 已关阀管段, 录入至多 6 条候选跨接(新增通水管段)。只读, 不改管网/不改方案。
+function appendCrossConnectPanel(r) {
+  const body = $("#result-body");
+  if (r.id == null) return; // 未入库结果不提供预览入口
+
+  state.crossRows = [];
+  const dryNormals = (r.node_status || [])
+    .filter((n) => n.role === "normal" && !n.supplied);
+
+  const card = document.createElement("div");
+  card.className = "card";
+  card.id = "cross-card";
+  card.innerHTML = `
+    <h3>临时供水跨接预览 <span class="role-name">(只读, 不修改管网与历史方案)</span></h3>
+    <p class="role-name">
+      基于方案快照与已关阀管段录入至多 <b>6 条</b>候选跨接: 每条含唯一编号、两个
+      <b>不同的现有节点</b>、正整数铺设费; 跨接视为<b>新增通水管段</b>(无阀, 始终通水)。
+      系统枚举候选组合, 在始终保持<b>全部漏点与进水点断开、全部必保点仍有水</b>的前提下:
+      先最大化由断水转为有水的<b>普通节点数</b>, 再最小化<b>铺设费</b>, 并列时按跨接编号
+      升序列表字典序选取; 无法恢复普通节点时返回<b>空方案</b>。
+    </p>
+    <p class="role-name">方案下当前断水的普通节点${
+      dryNormals.length ? ": <b>" + dryNormals.map((n) => esc(n.id)).join("、") + "</b>" : "（无，全部普通节点已有供水）"}。
+    </p>
+    <table id="table-cross">
+      <thead><tr><th>跨接编号</th><th>端点1(现有节点)</th><th>端点2(现有节点)</th><th>铺设费</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <button class="add-row" id="btn-add-cross" type="button">＋ 添加候选跨接</button>
+    <p>
+      <button id="btn-cross-run" type="button" class="primary">跨接预览求解</button>
+      <span class="role-name" id="cross-hint"></span>
+    </p>
+    <div id="cross-errors" class="errors hidden"></div>
+    <div id="cross-result"></div>`;
+  body.appendChild(card);
+
+  const nodeSelectHtml = (sel) =>
+    `<option value=""></option>${state.nodes.map((n) =>
+      `<option value="${esc(n.id)}"${n.id === sel ? " selected" : ""}>${esc(n.id)}（${ROLE_TEXT[n.role]}）</option>`).join("")}`;
+
+  function renderCrossRows() {
+    $("#table-cross tbody").innerHTML = state.crossRows.map((c, i) => `
+      <tr data-ci="${i}">
+        <td><input data-cf="id" value="${esc(c.id)}" placeholder="如 K1"></td>
+        <td><select data-cf="endpoint_a">${nodeSelectHtml(c.endpoint_a)}</select></td>
+        <td><select data-cf="endpoint_b">${nodeSelectHtml(c.endpoint_b)}</select></td>
+        <td><input data-cf="cost" type="number" min="1" step="1" value="${esc(c.cost)}"></td>
+        <td class="act"><button data-cross-del="${i}" title="删除">✕</button></td>
+      </tr>`).join("");
+    $("#cross-hint").textContent =
+      `候选跨接 ${state.crossRows.length}/6; 预览只读, 不写入管网与历史方案`;
+  }
+  renderCrossRows();
+
+  $("#btn-add-cross").addEventListener("click", () => {
+    if (state.crossRows.length >= 6) {
+      showCrossErrors(["候选跨接最多 6 条"]);
+      return;
+    }
+    state.crossRows.push({ id: "", endpoint_a: "", endpoint_b: "", cost: 1 });
+    renderCrossRows();
+  });
+
+  $("#table-cross").addEventListener("input", (e) => {
+    const tr = e.target.closest("tr[data-ci]");
+    if (!tr) return;
+    const f = e.target.dataset.cf;
+    if (f === undefined) return;
+    const i = Number(tr.dataset.ci);
+    let val = e.target.value;
+    if (f === "cost") val = Number(val);
+    state.crossRows[i][f] = val;
+  });
+
+  $("#table-cross").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-cross-del]");
+    if (!btn) return;
+    state.crossRows.splice(Number(btn.dataset.crossDel), 1);
+    renderCrossRows();
+  });
+
+  $("#btn-cross-run").addEventListener("click", () => runCrossPreview(r));
+}
+
+function showCrossErrors(errors) {
+  const box = $("#cross-errors");
+  box.innerHTML = `<b>无法进行跨接预览:</b><ul>${
+    errors.map((e) => `<li>${esc(e)}</li>`).join("")}</ul>`;
+  box.classList.remove("hidden");
+}
+
+async function runCrossPreview(r) {
+  const errBox = $("#cross-errors");
+  const resBox = $("#cross-result");
+  errBox.classList.add("hidden");
+  resBox.innerHTML = "";
+  const payload = {
+    cross_connections: state.crossRows
+      .filter((c) => c.id.trim() || c.endpoint_a || c.endpoint_b)
+      .map((c) => ({
+        id: c.id.trim(),
+        endpoint_a: (c.endpoint_a || "").trim(),
+        endpoint_b: (c.endpoint_b || "").trim(),
+        cost: c.cost,
+      })),
+  };
+  try {
+    const res = await api("POST", `/api/plans/${r.id}/cross-connect`, payload);
+    renderCrossResult(res);
+  } catch (err) {
+    showCrossErrors(String(err.message).split("\n"));
+  }
+}
+
+// 跨接后节点状态表: 高亮"由断水新恢复"的普通节点
+function crossNodeStatusTable(nodeStatus) {
+  return `
+    <table><thead><tr>
+      <th>节点</th><th>角色</th><th>跨接前</th><th>跨接后</th><th>连通的进水点</th>
+    </tr></thead>
+    <tbody>${nodeStatus.map((n) => {
+      const before = n.before_supplied
+        ? '<span class="tag supplied">有水</span>'
+        : '<span class="tag disconnected">断水</span>';
+      const afterTag = n.recovered
+        ? '<span class="tag flowing">有水 · 新恢复</span>'
+        : `<span class="tag ${n.status}">${STATUS_TEXT[n.status]}</span>`;
+      return `<tr><td>${esc(n.id)}${n.label && n.label !== n.id ? ` <span class="role-name">(${esc(n.label)})</span>` : ""}</td>
+      <td>${ROLE_TEXT[n.role]}</td><td>${before}</td><td>${afterTag}</td>
+      <td>${n.connected_inlets.length ? esc(n.connected_inlets.join(", ")) : "—"}</td></tr>`;
+    }).join("")}</tbody></table>`;
+}
+
+function renderCrossResult(res) {
+  const box = $("#cross-result");
+  if (!res.can_recover) {
+    box.innerHTML = `
+      <div class="banner bad">
+        <span class="big">○ 空方案（无法恢复普通节点）</span>${esc(res.message)}
+      </div>
+      <div class="card">
+        <h3>跨接后各节点状态（不铺设任何跨接）</h3>
+        ${crossNodeStatusTable(res.node_status)}
+      </div>`;
+    return;
+  }
+  const ccRows = res.selected_cross_connections.length
+    ? res.selected_cross_connections.map((c) => `
+        <tr><td><b>${esc(c.id)}</b></td>
+        <td>${esc(c.endpoint_a)} — ${esc(c.endpoint_b)}</td>
+        <td>${esc(c.cost)}</td>
+        <td><span class="tag flowing">新增通水</span></td></tr>`).join("")
+    : "";
+  box.innerHTML = `
+    <div class="banner ok">
+      <span class="big">✓ 跨接预览方案</span>${esc(res.message)}
+      <br><small>共枚举 ${res.subset_count} 个候选组合, 其中 ${res.valid_subset_count}
+      个满足「漏点全断开 + 必保点全有水」。本结果为只读预览, 未写入管网与历史方案。</small>
+    </div>
+    <div class="card">
+      <h3>选中跨接（${res.selected_cross_connections.length} 条）</h3>
+      <table><thead><tr><th>跨接编号</th><th>端点</th><th>铺设费</th><th>状态</th></tr></thead>
+      <tbody>${ccRows}</tbody></table>
+    </div>
+    <div class="card">
+      <h3>结果汇总</h3>
+      <div class="summary">
+        <span>铺设费合计: <b>${res.total_cost}</b></span>
+        <span>新恢复普通节点: <b>${res.recovered_node_count}</b> 个（${
+          res.recovered_node_ids.map(esc).join("、")}）</span>
+      </div>
+      <p class="role-name">优化次序: 先最大化由断水转为有水的普通节点数, 再最小化铺设费;
+      并列时按跨接编号升序列表字典序选取。</p>
+    </div>
+    <div class="card">
+      <h3>跨接后各节点状态</h3>
+      ${crossNodeStatusTable(res.node_status)}
+    </div>`;
 }
 
 // ---------- 历史 ----------

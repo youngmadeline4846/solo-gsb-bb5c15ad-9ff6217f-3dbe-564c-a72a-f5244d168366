@@ -9,6 +9,8 @@ API:
   GET  /api/plans                   最近方案列表
   GET  /api/plans/{id}              方案详情(含节点/管段状态)
   POST /api/plans/{id}/sequence     可行方案的现场执行顺序规划(只读计算)
+  POST /api/plans/{id}/cross-connect
+                                    可行方案的临时供水跨接预览(只读计算)
   POST /api/demo                    恢复内置示例管网
   POST /api/clear                   清空管网输入
 """
@@ -27,7 +29,7 @@ from pydantic import BaseModel, Field, field_validator
 import database
 from demo import DEMO_NETWORK
 from solver import (MAX_VALVES, NetworkValidationError, plan_sequence, solve,
-                    solve_failover, solve_siting)
+                    solve_cross_connect, solve_failover, solve_siting)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -93,6 +95,23 @@ class CandidateIn(BaseModel):
     segment_id: Any = None
     install_cost: Any = None
     close_cost: Any = None
+
+
+class CrossConnectionIn(BaseModel):
+    """临时供水跨接候选录入。
+
+    各字段(唯一编号/两个不同的现有节点/正整数铺设费)在
+    solver.solve_cross_connect 中复用快照校验逐条检查, 以便返回明确错误。
+    """
+    id: Any = None
+    endpoint_a: Any = None
+    endpoint_b: Any = None
+    cost: Any = None
+
+
+class CrossConnectRequest(BaseModel):
+    """跨接预览请求: 至多 6 条候选跨接。"""
+    cross_connections: list[CrossConnectionIn] = Field(default_factory=list)
 
 
 class SitingIn(BaseModel):
@@ -236,6 +255,38 @@ def plan_execution_sequence(plan_id: int, seq: SequenceIn) -> dict:
         raise HTTPException(status_code=422, detail={"errors": exc.errors})
     result["plan_id"] = plan_id
     result["solver"] = plan.get("solver", "base")
+    return result
+
+
+@app.post("/api/plans/{plan_id}/cross-connect")
+def plan_cross_connect(plan_id: int, req: CrossConnectRequest) -> dict:
+    """已保存可行方案的临时供水跨接预览(独立 API)。
+
+    只读计算: 仅读取方案及其管网快照与已关阀清单, 不修改、不新增任何数据。
+    基于方案快照枚举至多 6 条候选跨接(新增通水管段): 在始终保持全部漏点与
+    进水点断开、全部必保点仍有水的前提下, 先最大化由断水转有水的普通节点数,
+    再最小化铺设费, 并列时按跨接编号升序列表字典序选取; 无法恢复普通节点时
+    返回空方案。不可行方案、编号/端点/费用非法都会返回明确错误。
+    """
+    with database.get_conn() as conn:
+        plan = database.get_plan(conn, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+    if not plan.get("feasible"):
+        reason = plan.get("reason_code")
+        raise HTTPException(status_code=422, detail={"errors": [
+            f"方案 #{plan_id} 为不可行方案"
+            + (f"(reason_code: {reason})" if reason else "")
+            + ", 没有可执行的关阀清单, 不能做临时供水跨接预览"
+        ]})
+    try:
+        result = solve_cross_connect(plan["network_snapshot"],
+                                     plan.get("closed_valves", []),
+                                     [c.model_dump()
+                                      for c in req.cross_connections])
+    except NetworkValidationError as exc:
+        raise HTTPException(status_code=422, detail={"errors": exc.errors})
+    result["plan_id"] = plan_id
     return result
 
 
