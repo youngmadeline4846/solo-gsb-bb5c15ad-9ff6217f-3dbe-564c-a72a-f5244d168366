@@ -299,6 +299,7 @@ function renderResult(r) {
   if (r.solver === "failover") {
     renderFailover(r, banner, body);
     appendSequencePanel(r);
+    appendJumperPanel(r);
     drawCanvas();
     return;
   }
@@ -324,6 +325,7 @@ function renderResult(r) {
       ${segmentStatusTable(r.segment_status)}
     </div>`;
   appendSequencePanel(r);
+  appendJumperPanel(r);
   drawCanvas();
 }
 
@@ -629,6 +631,142 @@ function renderSequenceResult(res) {
       <td><b>${st.cumulative_exposure}</b></td>
     </tr>`).join("")}
     </tbody></table>`;
+}
+
+// ---------- 临时供水跨接预览 ----------
+// 入口: 可行方案详情(历史方案"查看"或刚求解出的方案)下方的预览卡片。
+// 只读计算, 不修改管网与历史方案。
+function appendJumperPanel(r) {
+  if (r.id == null) return; // 未入库结果不提供预览入口
+  const body = $("#result-body");
+  const card = document.createElement("div");
+  card.className = "card";
+  card.id = "jumper-card";
+  card.innerHTML = `
+    <h3>临时供水跨接预览 <span class="role-name">(只读计算, 不修改管网与历史方案)</span></h3>
+    <p class="role-name">
+      基于方案快照与已关阀管段(方案执行后的管网), 录入至多 6 条候选跨接:
+      每条含<b>唯一编号</b>、<b>两个不同的现有节点</b>与<b>正整数铺设费</b>,
+      跨接视为新增通水管段。枚举候选组合, 始终保持全部漏点与进水点断开、
+      全部必保点有水; 先最大化由断水转为有水的普通节点数, 再最小化铺设费合计,
+      并列时按跨接编号升序列表字典序选取; 无法恢复普通节点时返回空方案。
+    </p>
+    <table id="table-jumpers"><thead><tr>
+      <th>跨接编号</th><th>端点A</th><th>端点B</th><th>铺设费</th><th></th>
+    </tr></thead><tbody></tbody></table>
+    <button id="btn-add-jumper" class="add-row" type="button">＋ 添加候选跨接</button>
+    <p>
+      <button id="btn-jumpers" type="button" class="primary">跨接预览求解</button>
+      <span class="role-name" id="jumper-hint"></span>
+    </p>
+    <div id="jumper-errors" class="errors hidden"></div>
+    <div id="jumper-result"></div>`;
+  body.appendChild(card);
+
+  const jumpers = []; // 本地候选: {id, endpoint_a, endpoint_b, cost}
+  const tbody = card.querySelector("#table-jumpers tbody");
+  const nodeOpts = (sel) => state.nodes.map((n) =>
+    `<option value="${esc(n.id)}"${n.id === sel ? " selected" : ""}>${esc(n.id)}</option>`
+  ).join("");
+
+  function renderRows() {
+    tbody.innerHTML = jumpers.map((c, i) => `
+      <tr data-i="${i}">
+        <td><input data-f="id" value="${esc(c.id)}" placeholder="如 J1"></td>
+        <td><select data-f="endpoint_a"><option value=""></option>${nodeOpts(c.endpoint_a)}</select></td>
+        <td><select data-f="endpoint_b"><option value=""></option>${nodeOpts(c.endpoint_b)}</select></td>
+        <td><input data-f="cost" type="number" min="1" step="1" value="${esc(c.cost)}"></td>
+        <td class="act"><button data-del="${i}" title="删除">✕</button></td>
+      </tr>`).join("");
+    card.querySelector("#jumper-hint").textContent =
+      `候选跨接 ${jumpers.length} 条（至多 6 条）；跨接视为新增通水管段，预览只读`;
+  }
+
+  card.querySelector("#btn-add-jumper").addEventListener("click", () => {
+    if (jumpers.length >= 6) {
+      const errBox = card.querySelector("#jumper-errors");
+      errBox.innerHTML = "<b>候选跨接最多 6 条</b>";
+      errBox.classList.remove("hidden");
+      return;
+    }
+    jumpers.push({ id: "", endpoint_a: "", endpoint_b: "", cost: 1 });
+    renderRows();
+  });
+  tbody.addEventListener("input", (e) => {
+    const tr = e.target.closest("tr");
+    if (!tr) return;
+    const i = Number(tr.dataset.i);
+    const f = e.target.dataset.f;
+    if (f === undefined) return;
+    jumpers[i][f] = (f === "cost") ? Number(e.target.value) : e.target.value;
+  });
+  tbody.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-del]");
+    if (!btn) return;
+    jumpers.splice(Number(btn.dataset.del), 1);
+    renderRows();
+  });
+  card.querySelector("#btn-jumpers").addEventListener("click", async () => {
+    const errBox = card.querySelector("#jumper-errors");
+    const resBox = card.querySelector("#jumper-result");
+    errBox.classList.add("hidden");
+    resBox.innerHTML = "";
+    const candidates = jumpers
+      .filter((c) => c.id.trim() || c.endpoint_a || c.endpoint_b)
+      .map((c) => ({
+        id: c.id.trim(), endpoint_a: c.endpoint_a,
+        endpoint_b: c.endpoint_b, cost: c.cost,
+      }));
+    try {
+      const res = await api("POST", `/api/plans/${r.id}/jumpers`, { candidates });
+      renderJumperResult(res, resBox);
+    } catch (err) {
+      errBox.innerHTML = `<b>无法求解跨接预览:</b><ul>${
+        String(err.message).split("\n").map((e) => `<li>${esc(e)}</li>`).join("")}</ul>`;
+      errBox.classList.remove("hidden");
+    }
+  });
+  renderRows();
+}
+
+function renderJumperResult(res, box) {
+  const selTable = res.selected_jumpers.length ? `
+    <table><thead><tr><th>跨接编号</th><th>端点A</th><th>端点B</th><th>铺设费</th></tr></thead>
+    <tbody>${res.selected_jumpers.map((j) => `
+      <tr><td><b>${esc(j.id)}</b></td><td>${esc(j.endpoint_a)}</td>
+      <td>${esc(j.endpoint_b)}</td><td>${esc(j.cost)}</td></tr>`).join("")}
+    </tbody></table>` : "<p>空方案: 不铺设任何跨接。</p>";
+
+  const restored = res.restored_nodes.length
+    ? res.restored_nodes.map((id) => `<span class="tag supplied">${esc(id)}</span>`).join(" ")
+    : "无";
+  const segRows = res.segment_status.map((s) => `
+    <tr><td>${esc(s.id)}</td><td>${esc(s.endpoint_a)} — ${esc(s.endpoint_b)}</td>
+    <td>${s.is_jumper ? '<span class="tag flowing">跨接</span>' : "原有"}</td>
+    <td>${s.valve_id ? esc(s.valve_id) : "—"}</td>
+    <td><span class="tag ${s.status}">${STATUS_TEXT[s.status]}</span></td></tr>`).join("");
+
+  box.innerHTML = `
+    <div class="banner ok">
+      <span class="big">✓ ${res.restored_count ? "跨接预览方案" : "空方案"}</span>${esc(res.message)}
+      <br><small>共枚举 ${res.combination_count} 个候选组合, 其中
+      ${res.feasible_combination_count} 个保持漏点隔离与必保供水。
+      本结果为只读预览, 未修改管网与历史方案。</small>
+    </div>
+    <h4>选中跨接（${res.selected_jumpers.length} 条, 铺设费合计 ${res.lay_cost_total}）</h4>
+    ${selTable}
+    <p class="role-name">优化次序: 先最大化恢复供水的普通节点数, 再最小化铺设费合计;
+    并列时按跨接编号升序列表字典序选取。</p>
+    <h4>恢复供水节点（${res.restored_count} 个）</h4>
+    <p>由断水转为有水: ${restored}</p>
+    <p class="role-name">方案执行后断水的普通节点: ${
+      res.disconnected_normal_before.map(esc).join(", ") || "无"}；铺设跨接后仍断水: ${
+      res.still_disconnected_normal.map(esc).join(", ") || "无"}。</p>
+    <h4>各节点供水状态（铺设跨接后）</h4>
+    ${nodeStatusTable(res.node_status)}
+    <h4>各管段状态（含新增跨接管段）</h4>
+    <table><thead><tr><th>管段</th><th>端点</th><th>来源</th><th>绑定阀门</th><th>状态</th></tr></thead>
+    <tbody>${segRows}</tbody></table>`;
 }
 
 // ---------- 历史 ----------

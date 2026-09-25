@@ -9,6 +9,7 @@ API:
   GET  /api/plans                   最近方案列表
   GET  /api/plans/{id}              方案详情(含节点/管段状态)
   POST /api/plans/{id}/sequence     可行方案的现场执行顺序规划(只读计算)
+  POST /api/plans/{id}/jumpers      可行方案的临时供水跨接预览(只读计算)
   POST /api/demo                    恢复内置示例管网
   POST /api/clear                   清空管网输入
 """
@@ -26,8 +27,8 @@ from pydantic import BaseModel, Field, field_validator
 
 import database
 from demo import DEMO_NETWORK
-from solver import (MAX_VALVES, NetworkValidationError, plan_sequence, solve,
-                    solve_failover, solve_siting)
+from solver import (MAX_VALVES, NetworkValidationError, plan_jumpers,
+                    plan_sequence, solve, solve_failover, solve_siting)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -99,6 +100,23 @@ class SitingIn(BaseModel):
     """选址预览请求: 当前编辑中的管网(可空, 空则用已保存管网) + 候选位置。"""
     network: NetworkIn | None = None
     candidates: list[CandidateIn] = Field(default_factory=list)
+
+
+class JumperIn(BaseModel):
+    """临时供水跨接候选录入。
+
+    各字段(唯一跨接编号/两个不同的现有节点/正整数铺设费)在
+    solver.plan_jumpers 中逐条校验, 以便返回明确错误。
+    """
+    id: Any = None
+    endpoint_a: Any = None
+    endpoint_b: Any = None
+    cost: Any = None
+
+
+class JumpersIn(BaseModel):
+    """临时供水跨接预览录入: 至多 6 条候选跨接。"""
+    candidates: list[JumperIn] = Field(default_factory=list)
 
 
 @asynccontextmanager
@@ -232,6 +250,37 @@ def plan_execution_sequence(plan_id: int, seq: SequenceIn) -> dict:
         result = plan_sequence(plan["network_snapshot"],
                                plan.get("closed_valves", []),
                                seq.durations, seq.leak_weights)
+    except NetworkValidationError as exc:
+        raise HTTPException(status_code=422, detail={"errors": exc.errors})
+    result["plan_id"] = plan_id
+    result["solver"] = plan.get("solver", "base")
+    return result
+
+
+@app.post("/api/plans/{plan_id}/jumpers")
+def plan_jumper_preview(plan_id: int, req: JumpersIn) -> dict:
+    """已保存可行方案的临时供水跨接预览(独立 API, 只读计算)。
+
+    基于方案快照与已关阀管段, 评估至多 6 条候选跨接(新增通水管段):
+    在保持全部漏点与进水点断开、全部必保点有水的前提下, 先最大化由断水
+    转为有水的普通节点数, 再最小化铺设费合计, 并列时按跨接编号升序列表
+    字典序选取; 无法恢复普通节点时返回空方案。不修改管网与历史方案。
+    """
+    with database.get_conn() as conn:
+        plan = database.get_plan(conn, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+    if not plan.get("feasible"):
+        reason = plan.get("reason_code")
+        raise HTTPException(status_code=422, detail={"errors": [
+            f"方案 #{plan_id} 为不可行方案"
+            + (f"(reason_code: {reason})" if reason else "")
+            + ", 没有已关阀管段可作为跨接预览的基础, 不能规划临时供水跨接"
+        ]})
+    try:
+        result = plan_jumpers(plan["network_snapshot"],
+                              plan.get("closed_valves", []),
+                              [c.model_dump() for c in req.candidates])
     except NetworkValidationError as exc:
         raise HTTPException(status_code=422, detail={"errors": exc.errors})
     result["plan_id"] = plan_id
